@@ -14,6 +14,8 @@ It builds a lightweight SBOM from image layers, detects the Alpine OS version, f
   - `community`
 - Uses APK-aware version comparison (better than plain string comparison).
 - Deduplicates findings by package and CVE.
+- Adds package-level severity scoring (LOW to CRITICAL) based on finding breadth.
+- Prints remediation suggestions for each vulnerable package.
 - Prints scan context metrics for confidence and debugging.
 
 ## Current Scope
@@ -51,7 +53,9 @@ Target: alpine:3.14
 [!] VULNERABILITY FOUND: musl
     - Installed Version : 1.2.2-r4
     - Earliest Fix In   : 1.2.2_pre2-r0
+    - Severity          : LOW (score: 30/100)
     - CVEs              : CVE-2020-28928
+    - Remediation       : Upgrade musl to version 1.2.2_pre2-r0 or newer, then rebuild and redeploy the image.
 
 [!] Scan complete. 1 unique CVE findings detected.
 
@@ -62,6 +66,7 @@ Target: alpine:3.14
     - Packages Matched In DB  : 5
     - Vulnerable Packages     : 1
     - Unique CVE Findings     : 1
+    - Highest Severity        : LOW
 ```
 
 ## Run Tests

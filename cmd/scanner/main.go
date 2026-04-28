@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -13,6 +14,16 @@ import (
 	"sentinel-scanner/internal/extractor"
 	"sentinel-scanner/internal/matcher"
 )
+
+type PackageFinding struct {
+	PackageName      string
+	InstalledVersion string
+	EarliestFix      string
+	CVEs             []string
+	RiskScore        int
+	Severity         string
+	Remediation      string
+}
 
 func main() {
 	imageFlag := flag.String("image", "", "Docker image to scan (e.g., alpine:latest)")
@@ -73,9 +84,12 @@ func main() {
 	// 4. Scan the SBOM against the Database
 	fmt.Println("\n=== VULNERABILITY REPORT ===")
 	findingsByPkg := make(map[string]map[string]string)
+	installedVersions := make(map[string]string, len(sbom))
 	matchedPkgs := 0
 
 	for _, installedPkg := range sbom {
+		installedVersions[installedPkg.Name] = installedPkg.Version
+
 		// Does this package have known vulnerabilities in the database?
 		if secData, exists := vulnMap[installedPkg.Name]; exists {
 			matchedPkgs++
@@ -107,18 +121,11 @@ func main() {
 	}
 	sort.Strings(pkgNames)
 
+	reportFindings := make([]PackageFinding, 0, len(pkgNames))
 	for _, pkgName := range pkgNames {
 		cveToFix := findingsByPkg[pkgName]
 		if len(cveToFix) == 0 {
 			continue
-		}
-
-		var installedVersion string
-		for _, p := range sbom {
-			if p.Name == pkgName {
-				installedVersion = p.Version
-				break
-			}
 		}
 
 		cves := make([]string, 0, len(cveToFix))
@@ -131,10 +138,27 @@ func main() {
 		}
 		sort.Strings(cves)
 
-		fmt.Printf("[!] VULNERABILITY FOUND: %s\n", pkgName)
-		fmt.Printf("    - Installed Version : %s\n", installedVersion)
+		score := calculateRiskScore(len(cves))
+		severity := classifySeverity(score)
+		remediation := buildRemediation(pkgName, earliestFix)
+
+		reportFinding := PackageFinding{
+			PackageName:      pkgName,
+			InstalledVersion: installedVersions[pkgName],
+			EarliestFix:      earliestFix,
+			CVEs:             cves,
+			RiskScore:        score,
+			Severity:         severity,
+			Remediation:      remediation,
+		}
+		reportFindings = append(reportFindings, reportFinding)
+
+		fmt.Printf("[!] VULNERABILITY FOUND: %s\n", reportFinding.PackageName)
+		fmt.Printf("    - Installed Version : %s\n", reportFinding.InstalledVersion)
 		fmt.Printf("    - Earliest Fix In   : %s\n", earliestFix)
+		fmt.Printf("    - Severity          : %s (score: %d/100)\n", reportFinding.Severity, reportFinding.RiskScore)
 		fmt.Printf("    - CVEs              : %s\n\n", strings.Join(cves, ", "))
+		fmt.Printf("    - Remediation       : %s\n\n", reportFinding.Remediation)
 
 		vulnsFound += len(cves)
 	}
@@ -152,6 +176,7 @@ func main() {
 	fmt.Printf("    - Packages Matched In DB  : %d\n", matchedPkgs)
 	fmt.Printf("    - Vulnerable Packages     : %d\n", len(pkgNames))
 	fmt.Printf("    - Unique CVE Findings     : %d\n", vulnsFound)
+	fmt.Printf("    - Highest Severity        : %s\n", highestSeverity(reportFindings))
 }
 
 func detectAlpineVersion(imageRef string, sbom []analyzer.Package) (string, error) {
@@ -178,4 +203,46 @@ func detectAlpineVersion(imageRef string, sbom []analyzer.Package) (string, erro
 	}
 
 	return "", fmt.Errorf("could not determine Alpine version (missing alpine-release and unparseable image tag: %s)", imageRef)
+}
+
+func calculateRiskScore(cveCount int) int {
+	if cveCount <= 0 {
+		return 0
+	}
+
+	// Cap near 100 while keeping small sets of CVEs differentiated.
+	score := int(math.Round(100 * (1 - math.Exp(-0.35*float64(cveCount)))))
+	if score > 100 {
+		return 100
+	}
+	return score
+}
+
+func classifySeverity(score int) string {
+	switch {
+	case score >= 90:
+		return "CRITICAL"
+	case score >= 70:
+		return "HIGH"
+	case score >= 40:
+		return "MEDIUM"
+	case score > 0:
+		return "LOW"
+	default:
+		return "NONE"
+	}
+}
+
+func buildRemediation(pkgName, earliestFix string) string {
+	return fmt.Sprintf("Upgrade %s to version %s or newer, then rebuild and redeploy the image.", pkgName, earliestFix)
+}
+
+func highestSeverity(findings []PackageFinding) string {
+	maxScore := 0
+	for _, finding := range findings {
+		if finding.RiskScore > maxScore {
+			maxScore = finding.RiskScore
+		}
+	}
+	return classifySeverity(maxScore)
 }
