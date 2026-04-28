@@ -13,7 +13,7 @@ import (
 
 // ExtractImage saves the docker image to a temporary directory and unpacks it.
 // It returns the path to the unpacked directory, and a cleanup function.
-func ExtractImage(imageName string) (string, func(), error) {
+func ExtractImage(imageName string, verbose bool) (string, func(), error) {
 	// 1. Create a secure temporary directory
 	tempDir, err := os.MkdirTemp("", "sentinel-scanner-*")
 	if err != nil {
@@ -23,27 +23,35 @@ func ExtractImage(imageName string) (string, func(), error) {
 	// Setup our cleanup function to wipe the temp files when we are done
 	cleanup := func() {
 		os.RemoveAll(tempDir)
-		fmt.Println("Cleaned up temporary files.")
+		if verbose {
+			fmt.Println("Cleaned up temporary files.")
+		}
 	}
 
 	tarPath := filepath.Join(tempDir, "image.tar")
 	extractPath := filepath.Join(tempDir, "unpacked")
 
 	// 2. Shell out to Docker to save the image
-	fmt.Printf("Pulling and saving image '%s' (this might take a moment)...\n", imageName)
+	if verbose {
+		fmt.Printf("Pulling and saving image '%s' (this might take a moment)...\n", imageName)
+	}
 
 	// Find the docker binary safely
 	dockerBinary := getDockerPath()
 	
 	// 1.5. Pull the image from the registry to ensure it exists locally
-	fmt.Printf("Pulling image '%s' from registry...\n", imageName)
+	if verbose {
+		fmt.Printf("Pulling image '%s' from registry...\n", imageName)
+	}
 	pullCmd := exec.Command(dockerBinary, "pull", imageName)
 	if output, err := pullCmd.CombinedOutput(); err != nil {
 		return "", cleanup, fmt.Errorf("docker pull failed: %v\nOutput: %s", err, output)
 	}
 
 	// 2. Shell out to Docker to save the image
-	fmt.Printf("Pulling and saving image '%s' (using binary: %s)...\n", imageName, dockerBinary)
+	if verbose {
+		fmt.Printf("Pulling and saving image '%s' (using binary: %s)...\n", imageName, dockerBinary)
+	}
 	cmd := exec.Command(dockerBinary, "save", "-o", tarPath, imageName)
 
 	// Capture standard error in case docker fails (e.g., daemon not running)
@@ -56,7 +64,9 @@ func ExtractImage(imageName string) (string, func(), error) {
 		return "", cleanup, fmt.Errorf("failed to create extract dir: %w", err)
 	}
 
-	fmt.Println("Unpacking image layers...")
+	if verbose {
+		fmt.Println("Unpacking image layers...")
+	}
 	if err := untar(tarPath, extractPath); err != nil {
 		return "", cleanup, fmt.Errorf("failed to untar image: %w", err)
 	}

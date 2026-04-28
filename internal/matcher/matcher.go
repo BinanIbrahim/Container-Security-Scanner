@@ -42,7 +42,6 @@ func fetchSecDBFromBase(client *http.Client, baseURL, alpineVersion string) (*Se
 
 	for _, repo := range repos {
 		url := fmt.Sprintf("%s/v%s/%s.json", baseURL, alpineVersion, repo)
-		fmt.Printf("Downloading vulnerability database from: %s\n", url)
 
 		db, err := fetchSingleSecDB(client, url)
 		if err != nil {

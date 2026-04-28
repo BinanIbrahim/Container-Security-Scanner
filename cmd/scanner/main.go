@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -16,64 +17,102 @@ import (
 )
 
 type PackageFinding struct {
-	PackageName      string
-	InstalledVersion string
-	EarliestFix      string
-	CVEs             []string
-	RiskScore        int
-	Severity         string
-	Remediation      string
+	PackageName      string   `json:"packageName"`
+	InstalledVersion string   `json:"installedVersion"`
+	EarliestFix      string   `json:"earliestFix"`
+	CVEs             []string `json:"cves"`
+	RiskScore        int      `json:"riskScore"`
+	Severity         string   `json:"severity"`
+	Remediation      string   `json:"remediation"`
+}
+
+type ScanContext struct {
+	ScannedAtUTC       string `json:"scannedAtUtc"`
+	InstalledPackages  int    `json:"installedPackages"`
+	SecDBPackages      int    `json:"secdbPackages"`
+	MatchedPackages    int    `json:"matchedPackages"`
+	VulnerablePackages int    `json:"vulnerablePackages"`
+	UniqueCVEs         int    `json:"uniqueCves"`
+	HighestSeverity    string `json:"highestSeverity"`
+}
+
+type ScanReport struct {
+	TargetImage string           `json:"targetImage"`
+	Findings    []PackageFinding `json:"findings"`
+	Context     ScanContext      `json:"context"`
 }
 
 func main() {
 	imageFlag := flag.String("image", "", "Docker image to scan (e.g., alpine:latest)")
+	formatFlag := flag.String("format", "text", "Output format: text or json")
+	failOnFlag := flag.String("fail-on", "none", "Exit non-zero when highest severity meets threshold: none|low|medium|high|critical")
 	flag.Parse()
 
 	if *imageFlag == "" {
-		fmt.Println("Usage: scanner --image <image-name>")
+		fmt.Println("Usage: scanner --image <image-name> [--format text|json] [--fail-on none|low|medium|high|critical]")
 		os.Exit(1)
 	}
 
-	fmt.Printf("\n=== SENTINEL CONTAINER SCANNER ===\n")
-	fmt.Printf("Target: %s\n\n", *imageFlag)
+	outputFormat, err := normalizeFormat(*formatFlag)
+	if err != nil {
+		log.Fatalf("invalid format: %v", err)
+	}
 
-	// --- PHASE 1: EXTRACTION ---
-	fmt.Println("[*] Phase 1: Extracting Image...")
-	extractedPath, cleanup, err := extractor.ExtractImage(*imageFlag)
+	failThreshold, err := normalizeSeverityThreshold(*failOnFlag)
+	if err != nil {
+		log.Fatalf("invalid fail-on threshold: %v", err)
+	}
+
+	textOutput := outputFormat == "text"
+	if textOutput {
+		fmt.Printf("\n=== SENTINEL CONTAINER SCANNER ===\n")
+		fmt.Printf("Target: %s\n\n", *imageFlag)
+		fmt.Println("[*] Phase 1: Extracting Image...")
+	}
+
+	extractedPath, cleanup, err := extractor.ExtractImage(*imageFlag, textOutput)
 	if err != nil {
 		log.Fatalf("Extraction failed: %v", err)
 	}
 	defer cleanup()
 
-	// --- PHASE 2: ANALYSIS (SBOM) ---
-	fmt.Println("[*] Phase 2: Analyzing Layers...")
+	if textOutput {
+		fmt.Println("[*] Phase 2: Analyzing Layers...")
+	}
 	layers, err := analyzer.GetImageLayers(extractedPath)
 	if err != nil {
 		log.Fatalf("Failed to read manifest: %v", err)
 	}
 
-	sbom, err := analyzer.BuildSBOM(extractedPath, layers)
+	sbom, err := analyzer.BuildSBOM(extractedPath, layers, textOutput)
 	if err != nil {
 		log.Fatalf("Failed to build SBOM: %v", err)
 	}
-	fmt.Printf("    -> Generated SBOM with %d installed packages.\n", len(sbom))
+	if textOutput {
+		fmt.Printf("    -> Generated SBOM with %d installed packages.\n", len(sbom))
+	}
 
-	// --- PHASE 3: MATCHING (VULNERABILITIES) ---
-	fmt.Println("[*] Phase 3: Vulnerability Matching...")
+	if textOutput {
+		fmt.Println("[*] Phase 3: Vulnerability Matching...")
+	}
 
 	// 1. Detect Alpine Version dynamically
 	alpineVersion, err := detectAlpineVersion(*imageFlag, sbom)
 	if err != nil {
 		log.Fatalf("Failed to detect Alpine OS version from SBOM: %v", err)
 	}
-	fmt.Printf("    -> Detected Alpine OS Version: v%s\n", alpineVersion)
+	if textOutput {
+		fmt.Printf("    -> Detected Alpine OS Version: v%s\n", alpineVersion)
+	}
 
 	// 2. Fetch the correct Security Database
 	db, err := matcher.FetchSecDB(alpineVersion)
 	if err != nil {
 		log.Fatalf("Failed to fetch SecDB: %v", err)
 	}
-	fmt.Printf("    -> Loaded %d packages from Alpine SecDB.\n", len(db.Packages))
+	if textOutput {
+		fmt.Printf("    -> Loaded %d packages from Alpine SecDB.\n", len(db.Packages))
+	}
 
 	// 3. Convert the SecDB slice into a Map for fast lookups
 	vulnMap := make(map[string]matcher.SecPackage)
@@ -82,7 +121,9 @@ func main() {
 	}
 
 	// 4. Scan the SBOM against the Database
-	fmt.Println("\n=== VULNERABILITY REPORT ===")
+	if textOutput {
+		fmt.Println("\n=== VULNERABILITY REPORT ===")
+	}
 	findingsByPkg := make(map[string]map[string]string)
 	installedVersions := make(map[string]string, len(sbom))
 	matchedPkgs := 0
@@ -153,30 +194,60 @@ func main() {
 		}
 		reportFindings = append(reportFindings, reportFinding)
 
-		fmt.Printf("[!] VULNERABILITY FOUND: %s\n", reportFinding.PackageName)
-		fmt.Printf("    - Installed Version : %s\n", reportFinding.InstalledVersion)
-		fmt.Printf("    - Earliest Fix In   : %s\n", earliestFix)
-		fmt.Printf("    - Severity          : %s (score: %d/100)\n", reportFinding.Severity, reportFinding.RiskScore)
-		fmt.Printf("    - CVEs              : %s\n\n", strings.Join(cves, ", "))
-		fmt.Printf("    - Remediation       : %s\n\n", reportFinding.Remediation)
+		if textOutput {
+			fmt.Printf("[!] VULNERABILITY FOUND: %s\n", reportFinding.PackageName)
+			fmt.Printf("    - Installed Version : %s\n", reportFinding.InstalledVersion)
+			fmt.Printf("    - Earliest Fix In   : %s\n", earliestFix)
+			fmt.Printf("    - Severity          : %s (score: %d/100)\n", reportFinding.Severity, reportFinding.RiskScore)
+			fmt.Printf("    - CVEs              : %s\n", strings.Join(cves, ", "))
+			fmt.Printf("    - Remediation       : %s\n\n", reportFinding.Remediation)
+		}
 
 		vulnsFound += len(cves)
 	}
 
-	if vulnsFound == 0 {
-		fmt.Println("[✓] No known vulnerabilities found! Your image is clean.")
-	} else {
-		fmt.Printf("[!] Scan complete. %d unique CVE findings detected.\n", vulnsFound)
+	context := ScanContext{
+		ScannedAtUTC:       time.Now().UTC().Format(time.RFC3339),
+		InstalledPackages:  len(sbom),
+		SecDBPackages:      len(db.Packages),
+		MatchedPackages:    matchedPkgs,
+		VulnerablePackages: len(reportFindings),
+		UniqueCVEs:         vulnsFound,
+		HighestSeverity:    highestSeverity(reportFindings),
+	}
+	report := ScanReport{
+		TargetImage: *imageFlag,
+		Findings:    reportFindings,
+		Context:     context,
 	}
 
-	fmt.Println("\n=== SCAN CONTEXT ===")
-	fmt.Printf("    - Scanned At (UTC)        : %s\n", time.Now().UTC().Format(time.RFC3339))
-	fmt.Printf("    - Installed Packages      : %d\n", len(sbom))
-	fmt.Printf("    - SecDB Packages Loaded   : %d\n", len(db.Packages))
-	fmt.Printf("    - Packages Matched In DB  : %d\n", matchedPkgs)
-	fmt.Printf("    - Vulnerable Packages     : %d\n", len(pkgNames))
-	fmt.Printf("    - Unique CVE Findings     : %d\n", vulnsFound)
-	fmt.Printf("    - Highest Severity        : %s\n", highestSeverity(reportFindings))
+	if outputFormat == "json" {
+		payload, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			log.Fatalf("Failed to encode JSON output: %v", err)
+		}
+		fmt.Println(string(payload))
+	} else {
+		if vulnsFound == 0 {
+			fmt.Println("[✓] No known vulnerabilities found! Your image is clean.")
+		} else {
+			fmt.Printf("[!] Scan complete. %d unique CVE findings detected.\n", vulnsFound)
+		}
+
+		fmt.Println("\n=== SCAN CONTEXT ===")
+		fmt.Printf("    - Scanned At (UTC)        : %s\n", context.ScannedAtUTC)
+		fmt.Printf("    - Installed Packages      : %d\n", context.InstalledPackages)
+		fmt.Printf("    - SecDB Packages Loaded   : %d\n", context.SecDBPackages)
+		fmt.Printf("    - Packages Matched In DB  : %d\n", context.MatchedPackages)
+		fmt.Printf("    - Vulnerable Packages     : %d\n", context.VulnerablePackages)
+		fmt.Printf("    - Unique CVE Findings     : %d\n", context.UniqueCVEs)
+		fmt.Printf("    - Highest Severity        : %s\n", context.HighestSeverity)
+	}
+
+	if shouldFailBuild(context.HighestSeverity, failThreshold) {
+		log.Printf("Failing scan due to threshold policy: highest severity is %s (threshold: %s)", context.HighestSeverity, failThreshold)
+		os.Exit(2)
+	}
 }
 
 func detectAlpineVersion(imageRef string, sbom []analyzer.Package) (string, error) {
@@ -245,4 +316,48 @@ func highestSeverity(findings []PackageFinding) string {
 		}
 	}
 	return classifySeverity(maxScore)
+}
+
+func normalizeFormat(format string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "text":
+		return "text", nil
+	case "json":
+		return "json", nil
+	default:
+		return "", fmt.Errorf("%q (supported: text, json)", format)
+	}
+}
+
+func normalizeSeverityThreshold(threshold string) (string, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(threshold))
+	switch normalized {
+	case "NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("%q (supported: none, low, medium, high, critical)", threshold)
+	}
+}
+
+func severityRank(severity string) int {
+	switch strings.ToUpper(strings.TrimSpace(severity)) {
+	case "CRITICAL":
+		return 4
+	case "HIGH":
+		return 3
+	case "MEDIUM":
+		return 2
+	case "LOW":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func shouldFailBuild(highestSeverityValue, threshold string) bool {
+	thresholdRank := severityRank(threshold)
+	if thresholdRank == 0 {
+		return false
+	}
+	return severityRank(highestSeverityValue) >= thresholdRank
 }

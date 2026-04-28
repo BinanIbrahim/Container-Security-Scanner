@@ -50,7 +50,7 @@ type Package struct {
 
 // BuildSBOM searches through the container layers to find the Alpine package database,
 // parses it, and returns a list of installed packages (the SBOM).
-func BuildSBOM(extractPath string, layers []string) ([]Package, error) {
+func BuildSBOM(extractPath string, layers []string, verbose bool) ([]Package, error) {
 	var sbom []Package
 
 	// Iterate through the layers in the exact order specified by the manifest
@@ -103,7 +103,9 @@ func BuildSBOM(extractPath string, layers []string) ([]Package, error) {
 				}
 
 				if header.Name == "lib/apk/db/installed" {
-					fmt.Println("Found Alpine package database in layer:", layer)
+					if verbose {
+						fmt.Println("Found Alpine package database in layer:", layer)
+					}
 					sbom = parseAlpineDB(tr)
 				}
 			}

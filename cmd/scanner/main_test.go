@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -155,5 +156,114 @@ func TestHighestSeverity(t *testing.T) {
 	got := highestSeverity(findings)
 	if got != "CRITICAL" {
 		t.Fatalf("highestSeverity(findings) = %q, want %q", got, "CRITICAL")
+	}
+}
+
+func TestNormalizeFormat(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{input: "text", want: "text"},
+		{input: "json", want: "json"},
+		{input: " JSON ", want: "json"},
+		{input: "table", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.input, func(t *testing.T) {
+			t.Parallel()
+			got, err := normalizeFormat(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("normalizeFormat(%q) expected error, got nil", tc.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeFormat(%q) unexpected error: %v", tc.input, err)
+			}
+			if got != tc.want {
+				t.Fatalf("normalizeFormat(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeSeverityThresholdAndFailPolicy(t *testing.T) {
+	t.Parallel()
+
+	threshold, err := normalizeSeverityThreshold("high")
+	if err != nil {
+		t.Fatalf("normalizeSeverityThreshold(high) unexpected error: %v", err)
+	}
+	if threshold != "HIGH" {
+		t.Fatalf("normalizeSeverityThreshold(high) = %q, want HIGH", threshold)
+	}
+
+	if !shouldFailBuild("CRITICAL", "HIGH") {
+		t.Fatalf("shouldFailBuild should fail when highest >= threshold")
+	}
+	if shouldFailBuild("LOW", "HIGH") {
+		t.Fatalf("shouldFailBuild should not fail when highest < threshold")
+	}
+	if shouldFailBuild("CRITICAL", "NONE") {
+		t.Fatalf("shouldFailBuild should not fail for NONE threshold")
+	}
+
+	if _, err := normalizeSeverityThreshold("severe"); err == nil {
+		t.Fatalf("normalizeSeverityThreshold(severe) expected error, got nil")
+	}
+}
+
+func TestScanReportJSONShape(t *testing.T) {
+	t.Parallel()
+
+	report := ScanReport{
+		TargetImage: "alpine:3.14",
+		Findings: []PackageFinding{
+			{
+				PackageName:      "musl",
+				InstalledVersion: "1.2.2-r4",
+				EarliestFix:      "1.2.2_pre2-r0",
+				CVEs:             []string{"CVE-2020-28928"},
+				RiskScore:        30,
+				Severity:         "LOW",
+				Remediation:      "Upgrade musl to version 1.2.2_pre2-r0 or newer, then rebuild and redeploy the image.",
+			},
+		},
+		Context: ScanContext{
+			ScannedAtUTC:       "2026-04-28T18:24:20Z",
+			InstalledPackages:  14,
+			SecDBPackages:      462,
+			MatchedPackages:    5,
+			VulnerablePackages: 1,
+			UniqueCVEs:         1,
+			HighestSeverity:    "LOW",
+		},
+	}
+
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal(report) unexpected error: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(report) unexpected error: %v", err)
+	}
+
+	if decoded["targetImage"] != "alpine:3.14" {
+		t.Fatalf("targetImage mismatch: got %#v", decoded["targetImage"])
+	}
+	if _, ok := decoded["findings"]; !ok {
+		t.Fatalf("expected findings key in JSON output")
+	}
+	if _, ok := decoded["context"]; !ok {
+		t.Fatalf("expected context key in JSON output")
 	}
 }

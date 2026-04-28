@@ -7,6 +7,8 @@ It builds a lightweight SBOM from image layers, detects the Alpine OS version, f
 ## Features
 
 - Scans Docker images from the command line (`--image`).
+- Supports machine-readable JSON output for CI pipelines (`--format json`).
+- Supports policy-based build failure thresholds (`--fail-on`).
 - Extracts and analyzes image layers to build an SBOM.
 - Detects Alpine version from `alpine-release` (with safe fallback to image tag parsing).
 - Fetches and merges Alpine SecDB from both:
@@ -43,6 +45,12 @@ It builds a lightweight SBOM from image layers, detects the Alpine OS version, f
 go run cmd/scanner/main.go --image alpine:3.14
 ```
 
+CI-style run (JSON output + fail policy):
+
+```bash
+go run cmd/scanner/main.go --image alpine:3.14 --format json --fail-on high
+```
+
 ## Example Output
 
 ```text
@@ -75,6 +83,13 @@ Target: alpine:3.14
 go test ./...
 ```
 
+## Output And Policy Flags
+
+- `--format text|json` (default: `text`)
+- `--fail-on none|low|medium|high|critical` (default: `none`)
+
+`--fail-on` exits with a non-zero status when the highest finding severity meets or exceeds the selected threshold.
+
 ## Notes
 
 - Vulnerability results depend on the current SecDB snapshot at scan time.
@@ -82,6 +97,4 @@ go test ./...
 
 ## Roadmap Ideas
 
-- JSON output mode for CI pipelines.
-- Severity grouping in report output.
 - Support for additional Linux distributions.
