@@ -36,10 +36,12 @@ func TestIsVulnerableVersion(t *testing.T) {
 			want:      false,
 		},
 		{
-			name:      "pre style token compared correctly",
+			// The release 1.2.2 is newer than its own pre-release 1.2.2_pre2,
+			// so an installed release is not vulnerable to a pre-release fix.
+			name:      "installed release newer than prerelease fix",
 			installed: "1.2.2-r4",
 			fixed:     "1.2.2_pre2-r0",
-			want:      true,
+			want:      false,
 		},
 		{
 			name:      "git style token compared correctly",
