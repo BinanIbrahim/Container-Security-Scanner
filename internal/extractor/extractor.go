@@ -38,7 +38,7 @@ func ExtractImage(imageName string, verbose bool) (string, func(), error) {
 
 	// Find the docker binary safely
 	dockerBinary := getDockerPath()
-	
+
 	// 1.5. Pull the image from the registry to ensure it exists locally
 	if verbose {
 		fmt.Printf("Pulling image '%s' from registry...\n", imageName)

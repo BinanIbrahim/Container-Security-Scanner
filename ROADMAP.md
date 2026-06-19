@@ -27,7 +27,7 @@ Living document. Tick items off as they land; reorder when priorities change.
 
 ## Phase 4 — Project Hygiene
 
-- [ ] **CI pipeline** (GitHub Actions): `go vet`, `go test -race -cover`, `golangci-lint`, `govulncheck`, build matrix for linux/darwin amd64+arm64.
+- [x] **CI pipeline** (GitHub Actions): `go vet`, `go test -race -cover`, `golangci-lint`, `govulncheck`, build matrix for linux/darwin amd64+arm64.
 - [ ] **Release automation** with `goreleaser` → signed binaries + multi-arch container image.
 - [ ] **Integration tests** that scan a curated set of pinned images (`alpine:3.14`, `alpine:3.19`, a known-clean image, a known-vulnerable image) and assert findings.
 
