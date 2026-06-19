@@ -181,16 +181,42 @@ Found Alpine package database in layer: blobs/sha256/422ed46b1a92...
     - Highest Severity        : NONE
 ```
 
-When a package *is* behind its fix, each finding is reported in this format
-(illustrative):
+Scanning an older, end-of-life tag surfaces real findings. Here `alpine:3.10`
+reports a vulnerable `apk-tools` with its CVE, severity, and remediation:
 
 ```text
-[!] VULNERABILITY FOUND: libcrypto1.1
-    - Installed Version : 1.1.1k-r0
-    - Earliest Fix In   : 1.1.1l-r0
-    - Severity          : HIGH (score: 75/100)
-    - CVEs              : CVE-2021-3711, CVE-2021-3712, CVE-2021-4044, CVE-2022-0778
-    - Remediation       : Upgrade libcrypto1.1 to version 1.1.1l-r0 or newer, then rebuild and redeploy the image.
+=== SENTINEL CONTAINER SCANNER ===
+Target: alpine:3.10
+
+[*] Phase 1: Extracting Image...
+Pulling and saving image 'alpine:3.10' (this might take a moment)...
+Pulling image 'alpine:3.10' from registry...
+Unpacking image layers...
+[*] Phase 2: Analyzing Layers...
+Found Alpine package database in layer: blobs/sha256/26d14edc4f17...
+    -> Generated SBOM with 14 installed packages.
+[*] Phase 3: Vulnerability Matching...
+    -> Detected Alpine OS Version: v3.10
+    -> Loaded 285 packages from Alpine SecDB.
+
+=== VULNERABILITY REPORT ===
+[!] VULNERABILITY FOUND: apk-tools
+    - Installed Version : 2.10.6-r0
+    - Earliest Fix In   : 2.10.7-r0
+    - Severity          : LOW (score: 30/100)
+    - CVEs              : CVE-2021-36159
+    - Remediation       : Upgrade apk-tools to version 2.10.7-r0 or newer, then rebuild and redeploy the image.
+
+[!] Scan complete. 1 unique CVE findings detected.
+
+=== SCAN CONTEXT ===
+    - Scanned At (UTC)        : 2026-06-19T15:16:33Z
+    - Installed Packages      : 14
+    - SecDB Packages Loaded   : 285
+    - Packages Matched In DB  : 3
+    - Vulnerable Packages     : 1
+    - Unique CVE Findings     : 1
+    - Highest Severity        : LOW
 ```
 
 ## Output and Policy Flags
