@@ -1,0 +1,16 @@
+# golangci-lint configuration. Mirrors the linters required by CONVENTIONS.md.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck    # unchecked errors
+    - govet       # suspicious constructs
+    - staticcheck # static analysis
+    - revive      # style / lint rules
+    - gosec       # security issues
+
+issues:
+  # Don't cap the number of reported issues per linter/file.
+  max-issues-per-linter: 0
+  max-same-issues: 0
