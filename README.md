@@ -149,50 +149,49 @@ go build -o sentinel ./cmd/scanner
 
 ## Example Output
 
-A representative scan of an older Alpine image with known issues:
+A real scan of `alpine:3.14`. The current image is fully patched — five of its
+packages have SecDB advisories, but every one is already at or above the fixed
+version, so nothing is flagged:
 
 ```text
 === SENTINEL CONTAINER SCANNER ===
 Target: alpine:3.14
 
 [*] Phase 1: Extracting Image...
+Pulling and saving image 'alpine:3.14' (this might take a moment)...
 Pulling image 'alpine:3.14' from registry...
 Unpacking image layers...
 [*] Phase 2: Analyzing Layers...
-Found Alpine package database in layer: <layer-hash>/layer.tar
+Found Alpine package database in layer: blobs/sha256/422ed46b1a92...
     -> Generated SBOM with 14 installed packages.
 [*] Phase 3: Vulnerability Matching...
     -> Detected Alpine OS Version: v3.14
     -> Loaded 462 packages from Alpine SecDB.
 
 === VULNERABILITY REPORT ===
-[!] VULNERABILITY FOUND: busybox
-    - Installed Version : 1.33.1-r3
-    - Earliest Fix In   : 1.33.1-r7
-    - Severity          : LOW (score: 30/100)
-    - CVEs              : CVE-2021-42378
-    - Remediation       : Upgrade busybox to version 1.33.1-r7 or newer, then rebuild and redeploy the image.
+[✓] No known vulnerabilities found! Your image is clean.
 
+=== SCAN CONTEXT ===
+    - Scanned At (UTC)        : 2026-06-19T15:13:58Z
+    - Installed Packages      : 14
+    - SecDB Packages Loaded   : 462
+    - Packages Matched In DB  : 5
+    - Vulnerable Packages     : 0
+    - Unique CVE Findings     : 0
+    - Highest Severity        : NONE
+```
+
+When a package *is* behind its fix, each finding is reported in this format
+(illustrative):
+
+```text
 [!] VULNERABILITY FOUND: libcrypto1.1
     - Installed Version : 1.1.1k-r0
     - Earliest Fix In   : 1.1.1l-r0
     - Severity          : HIGH (score: 75/100)
     - CVEs              : CVE-2021-3711, CVE-2021-3712, CVE-2021-4044, CVE-2022-0778
     - Remediation       : Upgrade libcrypto1.1 to version 1.1.1l-r0 or newer, then rebuild and redeploy the image.
-
-[!] Scan complete. 5 unique CVE findings detected.
-
-=== SCAN CONTEXT ===
-    - Scanned At (UTC)        : 2026-06-19T13:10:23Z
-    - Installed Packages      : 14
-    - SecDB Packages Loaded   : 462
-    - Packages Matched In DB  : 5
-    - Vulnerable Packages     : 2
-    - Unique CVE Findings     : 5
-    - Highest Severity        : HIGH
 ```
-
-A clean image instead prints `[✓] No known vulnerabilities found!`.
 
 ## Output and Policy Flags
 
