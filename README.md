@@ -1,42 +1,131 @@
 # Sentinel Scanner
 
-Sentinel Scanner is a CLI tool that scans Alpine-based Docker images for known vulnerabilities.
+Sentinel Scanner is a **zero-dependency** **CLI** tool written in **Go** that
+scans **Alpine**-based **Docker images** for known security **vulnerabilities** —
+before they ship to production.
 
-It builds a lightweight SBOM from image layers, detects the Alpine OS version, fetches Alpine SecDB data, and reports vulnerable packages with CVE IDs.
+Container images bundle dozens of **OS packages**, and any one of them can carry
+a published **CVE**. Tracking that by hand is impractical: you would have to know
+every package and version baked into an image, cross-reference each against an
+ever-changing **vulnerability feed**, and understand **Alpine's APK versioning**
+rules to tell whether an installed version is actually older than the one that
+fixes a given CVE. Sentinel automates exactly that loop.
+
+Point it at an image and it works as a **pipeline**: it pulls and unpacks the
+image, reads the **Alpine package database** out of the layers to build a
+lightweight **SBOM** (software bill of materials), detects the Alpine OS version,
+downloads the matching **Alpine Security Database (SecDB)**, and compares every
+installed package against the known fixes using an **APK-aware version
+comparator**. The result is a clear report of vulnerable packages with their
+**CVE IDs**, a **severity score**, and concrete **remediation** guidance —
+printed for humans or emitted as **JSON** with a configurable failure threshold
+so it can **gate a CI pipeline**. It ships as a single **static binary** and
+pulls in **no third-party dependencies**.
 
 ## Features
 
-- Scans Docker images from the command line (`--image`).
-- Supports machine-readable JSON output for CI pipelines (`--format json`).
-- Supports policy-based build failure thresholds (`--fail-on`).
-- Extracts and analyzes image layers to build an SBOM.
-- Detects Alpine version from `alpine-release` (with safe fallback to image tag parsing).
-- Fetches and merges Alpine SecDB from both:
-  - `main`
-  - `community`
-- Uses APK-aware version comparison (better than plain string comparison).
-- Deduplicates findings by package and CVE.
-- Adds package-level severity scoring (LOW to CRITICAL) based on finding breadth.
-- Prints remediation suggestions for each vulnerable package.
-- Prints scan context metrics for confidence and debugging.
+- Scans **Docker images** from the command line (`--image`).
+- Machine-readable **JSON output** for **CI pipelines** (`--format json`).
+- **Policy-based build failure** thresholds (`--fail-on`).
+- Extracts and analyzes **image layers** to build an **SBOM**.
+- Detects the Alpine version from `alpine-release` (with safe fallback to image-tag parsing).
+- Fetches and merges **Alpine SecDB** from both the `main` and `community` repositories.
+- **APK-aware version comparison**, including pre/post-release suffix semantics (see below).
+- **Deduplicates** findings by package and CVE.
+- Package-level **severity scoring** (LOW to CRITICAL) and per-package **remediation** hints.
+- Prints **scan-context metrics** for confidence and debugging.
 
-## Current Scope
+## Architecture
 
-- Alpine images only.
-- Data source: Alpine Security Database (SecDB).
-- Requires Docker installed and running.
+The scanner runs as a linear **pipeline**. Each stage hands its output to the
+next, and the whole thing is orchestrated by `cmd/scanner/main.go`.
 
-## Project Structure
+```
+  --image alpine:3.14
+        │
+        ▼
+┌───────────────────┐
+│  docker pull      │   ensure the image exists locally
+│  docker save      │   export it to image.tar          ── internal/extractor
+│  unpack tarball   │   untar into a temp dir (zip-slip guarded)
+└─────────┬─────────┘
+          │  unpacked image (manifest.json + layer tarballs)
+          ▼
+┌───────────────────┐
+│  read manifest    │   ordered list of layers
+│  walk each layer  │   gzip/plain auto-detected         ── internal/analyzer
+│  parse apk DB     │   lib/apk/db/installed → SBOM
+└─────────┬─────────┘
+          │  SBOM: []{name, version}
+          ▼
+┌───────────────────┐
+│  detect version   │   alpine-release → v3.14
+│  fetch SecDB      │   main.json + community.json        ── internal/matcher
+│  merge + index    │   map[pkg] → secfixes
+└─────────┬─────────┘
+          │  vulnerability database
+          ▼
+┌───────────────────┐
+│  match versions   │   installed < fixed ?  (apk-aware)
+│  score severity   │   risk score → LOW…CRITICAL         ── cmd/scanner
+│  render report    │   text or JSON, apply --fail-on
+└─────────┬─────────┘
+          ▼
+   report + exit code
+```
 
-- `cmd/scanner/main.go`: CLI entrypoint and scan/report orchestration.
-- `internal/extractor/`: pulls, saves, and unpacks Docker images.
-- `internal/analyzer/`: reads manifest/layers and builds SBOM from Alpine package DB.
-- `internal/matcher/`: fetches SecDB, compares versions, and drives vulnerability matching helpers.
+Pipeline in one line:
+
+```
+docker pull → docker save → unpack → SBOM → SecDB → match → report
+```
+
+### Project structure
+
+- `cmd/scanner/main.go` — **CLI entrypoint**, matching loop, scoring, and report rendering.
+- `internal/extractor/` — pulls, saves, and unpacks **Docker images**.
+- `internal/analyzer/` — reads the manifest, walks layers, and builds the **SBOM** from the Alpine package DB.
+- `internal/matcher/` — fetches/merges **SecDB** and provides the **apk-aware version comparison**.
+
+## Why a custom APK version comparator?
+
+Deciding whether an installed package is vulnerable comes down to a single
+question: *is the installed version older than the version that fixes the CVE?*
+That comparison is the **correctness core** of the whole tool — get it wrong and
+the scanner silently produces **false negatives** (missed vulnerabilities) or
+**false positives**. So we implemented it ourselves, in
+[`internal/matcher/version.go`](internal/matcher/version.go), rather than pulling
+in a dependency. Three reasons:
+
+1. **Apk versions are not semver.** Alpine versions carry pre-release suffixes
+   (`_alpha`, `_beta`, `_pre`, `_rc`), post-release suffixes (`_cvs`, `_svn`,
+   `_git`, `_hg`, `_p`), and a build revision (`-rN`). The ordering is
+   `1.2_pre1 < 1.2 < 1.2_p1`. General-purpose **semver libraries**
+   (`Masterminds/semver`, `hashicorp/go-version`, …) implement the semver spec,
+   which has no notion of these suffixes — they would parse `1.2.2_pre2` as
+   garbage or rank it *above* `1.2.2`, inverting the result on exactly the
+   tricky cases that matter.
+
+2. **The canonical implementation is C.** The authoritative ordering lives in
+   apk-tools' **`apk_version.c`**. Porting its **token-based comparison** directly
+   (≈200 lines of pure Go, no allocations of note) is smaller and more auditable
+   than wrapping **cgo** or adopting a heavyweight third-party port.
+
+3. **Owning it lets us test it exhaustively, with zero supply-chain risk.** The
+   comparator is **pure logic**, so it is backed by a **table-driven** test plus a
+   **canonical 17-element ordering chain** checked all-pairs in both directions.
+   For a security tool, keeping `go.mod` free of third-party dependencies is itself
+   a feature (see [CONVENTIONS.md](CONVENTIONS.md)) — there is **no transitive
+   dependency** to audit, pin, or trust.
+
+> **Known limitation:** numeric components are compared as integers, so apk's
+> leading-zero fractional rule (`1.07` vs `1.1`) is not reproduced. SecDB package
+> versions do not rely on it.
 
 ## Requirements
 
-- Go `1.26.1` (as defined in `go.mod`)
-- Docker CLI + Docker daemon
+- **Go `1.26.1`** (as defined in [go.mod](go.mod))
+- **Docker CLI** + a running **Docker daemon**
 - Network access to `secdb.alpinelinux.org`
 
 ## Quick Start
@@ -51,50 +140,105 @@ CI-style run (JSON output + fail policy):
 go run cmd/scanner/main.go --image alpine:3.14 --format json --fail-on high
 ```
 
+Build a standalone binary:
+
+```bash
+go build -o sentinel ./cmd/scanner
+./sentinel --image alpine:3.14
+```
+
 ## Example Output
+
+A representative scan of an older Alpine image with known issues:
 
 ```text
 === SENTINEL CONTAINER SCANNER ===
 Target: alpine:3.14
-...
-=== VULNERABILITY REPORT ===
-[!] VULNERABILITY FOUND: musl
-    - Installed Version : 1.2.2-r4
-    - Earliest Fix In   : 1.2.2_pre2-r0
-    - Severity          : LOW (score: 30/100)
-    - CVEs              : CVE-2020-28928
-    - Remediation       : Upgrade musl to version 1.2.2_pre2-r0 or newer, then rebuild and redeploy the image.
 
-[!] Scan complete. 1 unique CVE findings detected.
+[*] Phase 1: Extracting Image...
+Pulling image 'alpine:3.14' from registry...
+Unpacking image layers...
+[*] Phase 2: Analyzing Layers...
+Found Alpine package database in layer: <layer-hash>/layer.tar
+    -> Generated SBOM with 14 installed packages.
+[*] Phase 3: Vulnerability Matching...
+    -> Detected Alpine OS Version: v3.14
+    -> Loaded 462 packages from Alpine SecDB.
+
+=== VULNERABILITY REPORT ===
+[!] VULNERABILITY FOUND: busybox
+    - Installed Version : 1.33.1-r3
+    - Earliest Fix In   : 1.33.1-r7
+    - Severity          : LOW (score: 30/100)
+    - CVEs              : CVE-2021-42378
+    - Remediation       : Upgrade busybox to version 1.33.1-r7 or newer, then rebuild and redeploy the image.
+
+[!] VULNERABILITY FOUND: libcrypto1.1
+    - Installed Version : 1.1.1k-r0
+    - Earliest Fix In   : 1.1.1l-r0
+    - Severity          : HIGH (score: 75/100)
+    - CVEs              : CVE-2021-3711, CVE-2021-3712, CVE-2021-4044, CVE-2022-0778
+    - Remediation       : Upgrade libcrypto1.1 to version 1.1.1l-r0 or newer, then rebuild and redeploy the image.
+
+[!] Scan complete. 5 unique CVE findings detected.
 
 === SCAN CONTEXT ===
-    - Scanned At (UTC)        : 2026-04-26T13:10:23Z
+    - Scanned At (UTC)        : 2026-06-19T13:10:23Z
     - Installed Packages      : 14
     - SecDB Packages Loaded   : 462
     - Packages Matched In DB  : 5
-    - Vulnerable Packages     : 1
-    - Unique CVE Findings     : 1
-    - Highest Severity        : LOW
+    - Vulnerable Packages     : 2
+    - Unique CVE Findings     : 5
+    - Highest Severity        : HIGH
 ```
 
-## Run Tests
+A clean image instead prints `[✓] No known vulnerabilities found!`.
 
-```bash
-go test ./...
-```
-
-## Output And Policy Flags
+## Output and Policy Flags
 
 - `--format text|json` (default: `text`)
 - `--fail-on none|low|medium|high|critical` (default: `none`)
 
-`--fail-on` exits with a non-zero status when the highest finding severity meets or exceeds the selected threshold.
+`--fail-on` makes the scanner exit non-zero when the highest finding severity
+meets or exceeds the threshold — use it to **gate a build or pipeline**.
 
-## Notes
+### Exit codes
 
-- Vulnerability results depend on the current SecDB snapshot at scan time.
-- Older image tags can still receive newly published CVEs as advisory data evolves.
+| Code | Meaning                                                     |
+|------|-------------------------------------------------------------|
+| `0`  | Scan completed; no `--fail-on` threshold met.               |
+| `1`  | Usage or runtime error (bad flag, extraction/network fail). |
+| `2`  | Scan completed but the `--fail-on` threshold was triggered. |
 
-## Roadmap Ideas
+## Known Limitations
 
-- Support for additional Linux distributions.
+These are deliberate boundaries of the current scope, not accidental gaps. Several
+are tracked as roadmap items in [ROADMAP.md](ROADMAP.md).
+
+- **Alpine only.** Detection and the SecDB source are Alpine-specific. Debian/Ubuntu
+  (dpkg) and RHEL/UBI (rpm) are planned behind a `DistroAdapter` interface but not
+  implemented.
+- **Static layer scan, not runtime.** The scanner reads the apk database baked into
+  the image layers. It does **not** inspect a running container, observe processes,
+  or catch packages installed at runtime (e.g. an `apk add` in an entrypoint).
+- **OS packages only.** It matches the Alpine package database. Language-level
+  dependencies (`node_modules`, `go.mod`, `requirements.txt`, …) are not yet scanned.
+- **Severity is derived from CVE count, not CVSS.** A package with one critical RCE
+  can currently score lower than one with several low-impact issues. Real CVSS
+  scoring (via NVD/OSV) is the top Phase 2 roadmap item.
+- **Requires the Docker daemon.** Images are obtained via `docker pull`/`docker save`.
+  Daemonless registry pulls are planned.
+- **Results track the live SecDB snapshot.** Findings can change over time as
+  advisory data evolves, even for a fixed image tag.
+
+## Run Tests
+
+```bash
+go test -race ./...
+```
+
+## Contributing
+
+Development conventions (package boundaries, error handling, testing, the
+zero-dependency policy) are documented in [CONVENTIONS.md](CONVENTIONS.md), and
+planned work is tracked in [ROADMAP.md](ROADMAP.md).
