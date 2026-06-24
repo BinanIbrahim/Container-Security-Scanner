@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Go build output
+/scanner
+sentinel-scanner
+*.exe
+*.test
+*.out
+coverage.out
+
+# Scanner working artifacts (temp image tarballs / unpacked layers)
+*.tar
+/tmp/
