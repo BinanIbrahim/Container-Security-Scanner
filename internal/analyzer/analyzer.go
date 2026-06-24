@@ -1,4 +1,5 @@
-// internal/analyzer/analyzer.go
+// Package analyzer reads unpacked image layers to locate and parse the Alpine
+// package database, producing the software bill of materials (SBOM).
 package analyzer
 
 import (
@@ -28,7 +29,7 @@ func GetImageLayers(extractPath string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not open manifest.json: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	var manifest Manifest
 	if err := json.NewDecoder(file).Decode(&manifest); err != nil {
@@ -65,7 +66,7 @@ func BuildSBOM(extractPath string, layers []string, verbose bool) ([]Package, er
 			if err != nil {
 				return fmt.Errorf("failed to open layer %s: %w", layer, err)
 			}
-			defer file.Close() // Safely closes at the end of this anonymous function
+			defer func() { _ = file.Close() }() // Safely closes at the end of this anonymous function
 
 			// We use bufio.Reader so we can "peek" ahead into the file stream without consuming it.
 			br := bufio.NewReader(file)
@@ -85,7 +86,7 @@ func BuildSBOM(extractPath string, layers []string, verbose bool) ([]Package, er
 				if err != nil {
 					return fmt.Errorf("failed to create gzip reader: %w", err)
 				}
-				defer gzr.Close()
+				defer func() { _ = gzr.Close() }()
 				tr = tar.NewReader(gzr)
 			} else {
 				// Layer is UNCOMPRESSED plain tar.

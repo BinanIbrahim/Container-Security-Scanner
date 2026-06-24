@@ -1,4 +1,5 @@
-// internal/extractor/extractor.go
+// Package extractor saves a Docker image via the docker CLI and unpacks its
+// layers into a temporary directory for analysis.
 package extractor
 
 import (
@@ -22,7 +23,7 @@ func ExtractImage(imageName string, verbose bool) (string, func(), error) {
 
 	// Setup our cleanup function to wipe the temp files when we are done
 	cleanup := func() {
-		os.RemoveAll(tempDir)
+		_ = os.RemoveAll(tempDir)
 		if verbose {
 			fmt.Println("Cleaned up temporary files.")
 		}
@@ -60,7 +61,7 @@ func ExtractImage(imageName string, verbose bool) (string, func(), error) {
 	}
 
 	// 3. Unpack the tarball
-	if err := os.Mkdir(extractPath, 0755); err != nil {
+	if err := os.Mkdir(extractPath, 0750); err != nil {
 		return "", cleanup, fmt.Errorf("failed to create extract dir: %w", err)
 	}
 
@@ -80,7 +81,7 @@ func untar(tarball, targetDir string) error {
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	tr := tar.NewReader(reader)
 
@@ -93,29 +94,36 @@ func untar(tarball, targetDir string) error {
 			return err
 		}
 
-		// SECURITY BONUS: Prevent "Zip-Slip" vulnerability (Path Traversal)
-		targetPath := filepath.Join(targetDir, header.Name)
+		// SECURITY: Prevent "Zip-Slip" vulnerability (Path Traversal). The
+		// gosec G305 finding on the Join below is mitigated by this prefix check.
+		targetPath := filepath.Join(targetDir, header.Name) //nolint:gosec // G305 guarded by the prefix check immediately below
 		if !strings.HasPrefix(targetPath, filepath.Clean(targetDir)+string(os.PathSeparator)) {
 			return fmt.Errorf("illegal file path: %s", header.Name)
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(targetPath, 0755); err != nil {
+			if err := os.MkdirAll(targetPath, 0750); err != nil {
 				return err
 			}
 		case tar.TypeReg:
 			// Ensure parent directories exist
-			os.MkdirAll(filepath.Dir(targetPath), 0755)
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0750); err != nil {
+				return err
+			}
 			outFile, err := os.Create(targetPath)
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(outFile, tr); err != nil {
-				outFile.Close()
+			// G110: layers come from a local `docker save`; an unbounded copy is
+			// acceptable here since image layers are legitimately large.
+			if _, err := io.Copy(outFile, tr); err != nil { //nolint:gosec // G110 decompression bomb: input is local docker save output
+				_ = outFile.Close()
 				return err
 			}
-			outFile.Close()
+			if err := outFile.Close(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
