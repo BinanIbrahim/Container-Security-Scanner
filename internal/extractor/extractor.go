@@ -68,15 +68,62 @@ func ExtractImage(imageName string, verbose bool) (string, func(), error) {
 	if verbose {
 		fmt.Println("Unpacking image layers...")
 	}
-	if err := untar(tarPath, extractPath); err != nil {
+	if err := New().Untar(tarPath, extractPath); err != nil {
 		return "", cleanup, fmt.Errorf("failed to untar image: %w", err)
 	}
 
 	return extractPath, cleanup, nil
 }
 
-// untar is a helper function to extract a tarball to a target directory
-func untar(tarball, targetDir string) error {
+// DefaultFileSizeCap is the maximum number of bytes extracted for a single tar
+// entry. Entries exceeding this limit cause extraction to fail, guarding
+// against tar bombs that inflate one file to fill the disk.
+const DefaultFileSizeCap int64 = 512 << 20 // 512 MiB
+
+// DefaultTotalSizeCap is the maximum number of bytes extracted across all
+// entries in a single call to Untar. A layer that pushes the cumulative total
+// past this limit causes extraction to fail.
+const DefaultTotalSizeCap int64 = 2 << 30 // 2 GiB
+
+// Extractor holds configuration for unpacking container image tarballs safely.
+type Extractor struct {
+	// FileSizeCap is the per-entry byte limit. Zero means DefaultFileSizeCap.
+	FileSizeCap int64
+	// TotalSizeCap is the cumulative byte limit across all entries in a single
+	// Untar call. Zero means DefaultTotalSizeCap.
+	TotalSizeCap int64
+}
+
+// New returns an Extractor configured with the default size caps.
+func New() *Extractor {
+	return &Extractor{
+		FileSizeCap:  DefaultFileSizeCap,
+		TotalSizeCap: DefaultTotalSizeCap,
+	}
+}
+
+// fileSizeCap returns the effective per-entry cap, substituting the default
+// when the field is left at its zero value.
+func (e *Extractor) fileSizeCap() int64 {
+	if e.FileSizeCap <= 0 {
+		return DefaultFileSizeCap
+	}
+	return e.FileSizeCap
+}
+
+// totalSizeCap returns the effective cumulative cap, substituting the default
+// when the field is left at its zero value.
+func (e *Extractor) totalSizeCap() int64 {
+	if e.TotalSizeCap <= 0 {
+		return DefaultTotalSizeCap
+	}
+	return e.TotalSizeCap
+}
+
+// Untar extracts a tarball into targetDir, enforcing the configured size caps
+// and rejecting any entry whose path — or symlink/hardlink target — escapes
+// the extraction root.
+func (e *Extractor) Untar(tarball, targetDir string) error {
 	reader, err := os.Open(tarball)
 	if err != nil {
 		return err
@@ -85,6 +132,7 @@ func untar(tarball, targetDir string) error {
 
 	tr := tar.NewReader(reader)
 
+	var totalBytes int64
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -94,39 +142,106 @@ func untar(tarball, targetDir string) error {
 			return err
 		}
 
-		// SECURITY: Prevent "Zip-Slip" vulnerability (Path Traversal). The
-		// gosec G305 finding on the Join below is mitigated by this prefix check.
-		targetPath := filepath.Join(targetDir, header.Name) //nolint:gosec // G305 guarded by the prefix check immediately below
-		if !strings.HasPrefix(targetPath, filepath.Clean(targetDir)+string(os.PathSeparator)) {
-			return fmt.Errorf("illegal file path: %s", header.Name)
+		// Defence in depth: reject absolute paths and any ".." component before
+		// we touch the filesystem. The check is intentionally coarse — it would
+		// also reject an unusual-but-legal name like "foo..bar" — because for a
+		// security scanner a false rejection is cheaper than a missed traversal.
+		if filepath.IsAbs(header.Name) || strings.Contains(header.Name, "..") {
+			return fmt.Errorf("extract entry %q: path traversal detected", header.Name)
+		}
+
+		// SECURITY: Prevent "Zip-Slip" (path traversal). The gosec G305 finding
+		// on the Join is mitigated by isSafePath immediately below.
+		targetPath := filepath.Join(targetDir, header.Name) //nolint:gosec // G305 guarded by isSafePath below
+		if !isSafePath(targetDir, header.Name) {
+			return fmt.Errorf("extract entry %q: path traversal detected", header.Name)
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(targetPath, 0750); err != nil {
-				return err
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
 			}
 		case tar.TypeReg:
 			// Ensure parent directories exist
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0750); err != nil {
-				return err
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
 			}
 			outFile, err := os.Create(targetPath)
 			if err != nil {
-				return err
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
 			}
-			// G110: layers come from a local `docker save`; an unbounded copy is
-			// acceptable here since image layers are legitimately large.
-			if _, err := io.Copy(outFile, tr); err != nil { //nolint:gosec // G110 decompression bomb: input is local docker save output
+			// Cap the copy at fileSizeCap+1 so we can tell "fit exactly" from
+			// "overflowed" without a second read of the underlying stream.
+			limit := e.fileSizeCap()
+			n, err := io.Copy(outFile, io.LimitReader(tr, limit+1))
+			if err != nil {
 				_ = outFile.Close()
-				return err
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
 			}
 			if err := outFile.Close(); err != nil {
-				return err
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
+			}
+			if n > limit {
+				return fmt.Errorf("extract entry %q: file size exceeds cap of %d bytes", header.Name, limit)
+			}
+			totalBytes += n
+			if totalBytes > e.totalSizeCap() {
+				return fmt.Errorf("extract entry %q: total extraction size exceeds cap of %d bytes", header.Name, e.totalSizeCap())
+			}
+		case tar.TypeSymlink:
+			// Resolve the link target relative to the entry's own directory and
+			// confirm it stays in-tree. An absolute Linkname must be checked as
+			// an absolute path — filepath.Join would silently re-root it.
+			// NOTE: this does not chase symlink chains; callers that resolve
+			// links after extraction must re-check with filepath.EvalSymlinks.
+			linkDir := filepath.Dir(targetPath)
+			if linkEscapes(linkDir, targetDir, header.Linkname) {
+				return fmt.Errorf("extract entry %q: symlink target %q escapes extraction root", header.Name, header.Linkname)
+			}
+			if err := os.MkdirAll(linkDir, 0750); err != nil {
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
+			}
+			if err := os.Symlink(header.Linkname, targetPath); err != nil {
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
+			}
+		case tar.TypeLink:
+			// Hardlink targets are conventionally relative to the extraction
+			// root. Resolve against it (treating an absolute target literally)
+			// and reject anything that escapes.
+			if linkEscapes(targetDir, targetDir, header.Linkname) {
+				return fmt.Errorf("extract entry %q: hardlink target %q escapes extraction root", header.Name, header.Linkname)
+			}
+			linkTarget := filepath.Join(targetDir, header.Linkname) //nolint:gosec // G305 guarded by linkEscapes above
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0750); err != nil {
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
+			}
+			if err := os.Link(linkTarget, targetPath); err != nil {
+				return fmt.Errorf("extract entry %q: %w", header.Name, err)
 			}
 		}
 	}
 	return nil
+}
+
+// isSafePath reports whether joining root and name stays within root after
+// cleaning, i.e. the entry does not escape the extraction directory.
+func isSafePath(root, name string) bool {
+	clean := filepath.Join(root, name)
+	return strings.HasPrefix(clean, filepath.Clean(root)+string(os.PathSeparator))
+}
+
+// linkEscapes reports whether a link target points outside root. A relative
+// target is resolved against base; an absolute target is checked literally,
+// since that is exactly how the OS will resolve the link on disk.
+func linkEscapes(base, root, linkname string) bool {
+	var resolved string
+	if filepath.IsAbs(linkname) {
+		resolved = filepath.Clean(linkname)
+	} else {
+		resolved = filepath.Clean(filepath.Join(base, linkname))
+	}
+	return !strings.HasPrefix(resolved, filepath.Clean(root)+string(os.PathSeparator))
 }
 
 // getDockerPath attempts to find the Docker executable even if the environment PATH is messed up.

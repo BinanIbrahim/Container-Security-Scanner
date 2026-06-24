@@ -2,6 +2,16 @@
 
 Rules that apply to every change in this repo. Treat this like a contract: if a PR breaks one of these, either fix the PR or update this document explicitly with a rationale.
 
+## Common Commands
+
+```bash
+go build ./...                        # build
+go test -race ./...                   # run all tests with race detector
+go test -race -run TestName ./...     # run a single test
+golangci-lint run                     # lint (must match CI: v2.12.2)
+govulncheck ./...                     # vulnerability scan
+```
+
 ## Code
 
 - **Package boundaries match domain verbs**, not technical layers: `extractor`, `analyzer`, `matcher`. Do not add `utils`, `common`, `helpers`. If something doesn't fit an existing package, create a new domain-named one.
@@ -39,8 +49,17 @@ Rules that apply to every change in this repo. Treat this like a contract: if a 
 - **Justify every new dep in the PR description.** Standard library first. Current `go.mod` has zero third-party deps — that's a feature worth defending until something like multi-distro support forces it.
 - **Pin Go toolchain** in `go.mod`; bump deliberately, not opportunistically.
 
+## Agents
+
+- **Before every push to GitHub**, run a code-reviewer agent on the changed files: "Use the code-reviewer agent to review the changes on this branch before I push." Do not push until the review passes or findings are explicitly accepted by the user.
+- **Before starting any new feature from `ROADMAP.md`**, spawn a Plan agent: "Use a Plan agent to design [feature name] based on the roadmap." The plan must be approved by the user before any code is written.
+
+## Feature Briefing
+
+- **Before starting any feature**, write a short plain-English brief to the user covering three things: (1) what we are building, (2) why we are building it (the problem it solves), and (3) how it benefits the project or the user. Two to four sentences is enough — no headers, no bullet walls. Wait for the user to acknowledge before spawning the Plan agent or writing any code.
+
 ## Working With These Docs
 
 - `ROADMAP.md` is the source of truth for what to build next. Pick the topmost unchecked item in the current phase unless the user redirects.
-- `CONVENTIONS.md` (this file) applies to *every* change. Updates to it require an explicit user request — do not silently change the rules.
+- `CLAUDE.md` (this file) applies to *every* change. Updates to it require an explicit user request — do not silently change the rules.
 - When you finish a roadmap item, tick the checkbox in the same commit that lands the change.
