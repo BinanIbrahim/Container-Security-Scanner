@@ -1,4 +1,6 @@
-# golangci-lint configuration. Mirrors the linters required by CONVENTIONS.md.
+# golangci-lint configuration (v2 schema). Mirrors the linters required by CONVENTIONS.md.
+version: "2"
+
 run:
   timeout: 5m
 
@@ -9,6 +11,14 @@ linters:
     - staticcheck # static analysis
     - revive      # style / lint rules
     - gosec       # security issues
+  exclusions:
+    rules:
+      # This is a CLI that, by design, shells out to the `docker` binary and
+      # opens files by paths it computes while unpacking image layers.
+      - linters: [gosec]
+        text: "G204" # subprocess launched with variable (docker pull/save)
+      - linters: [gosec]
+        text: "G304" # file inclusion via variable path (layer/manifest reads)
 
 issues:
   # Don't cap the number of reported issues per linter/file.

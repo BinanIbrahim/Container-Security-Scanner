@@ -1,3 +1,5 @@
+// Command scanner is the Sentinel Scanner CLI entry point: it pulls an Alpine
+// Docker image, builds its SBOM, and reports matching CVEs from Alpine SecDB.
 package main
 
 import (

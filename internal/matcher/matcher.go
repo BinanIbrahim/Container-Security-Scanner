@@ -1,4 +1,5 @@
-// internal/matcher/matcher.go
+// Package matcher fetches the Alpine SecDB advisories and matches them against
+// the SBOM to report vulnerable packages.
 package matcher
 
 import (
@@ -80,7 +81,7 @@ func fetchSingleSecDB(client *http.Client, url string) (*SecDB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch SecDB: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("SecDB returned non-200 status: %d", resp.StatusCode)
