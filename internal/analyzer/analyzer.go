@@ -1,17 +1,20 @@
-// Package analyzer reads unpacked image layers to locate and parse the Alpine
-// package database, producing the software bill of materials (SBOM).
+// Package analyzer streams the layers of a saved Docker image tarball to locate
+// and parse the Alpine package database, producing the software bill of
+// materials (SBOM) without unpacking the image to disk.
 package analyzer
 
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
+
+	"sentinel-scanner/internal/extractor"
 )
 
 // Manifest represents the structure of the Docker manifest.json file.
@@ -21,26 +24,19 @@ type Manifest []struct {
 	Layers   []string `json:"Layers"`
 }
 
-// GetImageLayers reads the manifest.json and returns the ordered list of layer tarballs.
-func GetImageLayers(extractPath string) ([]string, error) {
-	manifestPath := filepath.Join(extractPath, "manifest.json")
-
-	file, err := os.Open(manifestPath)
-	if err != nil {
-		return nil, fmt.Errorf("could not open manifest.json: %w", err)
-	}
-	defer func() { _ = file.Close() }()
-
-	var manifest Manifest
-	if err := json.NewDecoder(file).Decode(&manifest); err != nil {
-		return nil, fmt.Errorf("failed to parse manifest.json: %w", err)
+// GetImageLayers decodes a Docker manifest.json and returns the ordered list of
+// layer tarball paths.
+func GetImageLayers(manifest io.Reader) ([]string, error) {
+	var m Manifest
+	if err := json.NewDecoder(manifest).Decode(&m); err != nil {
+		return nil, fmt.Errorf("parse manifest.json: %w", err)
 	}
 
-	if len(manifest) == 0 || len(manifest[0].Layers) == 0 {
+	if len(m) == 0 || len(m[0].Layers) == 0 {
 		return nil, fmt.Errorf("invalid manifest: no layers found")
 	}
 
-	return manifest[0].Layers, nil
+	return m[0].Layers, nil
 }
 
 // Package represents a single installed software package.
@@ -49,80 +45,179 @@ type Package struct {
 	Version string
 }
 
-// BuildSBOM searches through the container layers to find the Alpine package database,
-// parses it, and returns a list of installed packages (the SBOM).
-func BuildSBOM(extractPath string, layers []string, verbose bool) ([]Package, error) {
-	var sbom []Package
+// Options configures SBOM construction.
+type Options struct {
+	// Verbose enables progress output to stdout.
+	Verbose bool
+}
 
-	// Iterate through the layers in the exact order specified by the manifest
-	for _, layer := range layers {
-		// Optimization: We wrap the file logic in an anonymous function (a closure).
-		// This ensures 'defer file.Close()' runs immediately after each layer finishes processing,
-		// preventing a file-descriptor memory leak on massive images with 100+ layers.
-		err := func() error {
-			layerPath := filepath.Join(extractPath, layer)
+const (
+	manifestName  = "manifest.json"
+	apkDBPath     = "lib/apk/db/installed"
+	apkDBWhiteout = "lib/apk/db/.wh.installed"
+	apkDBOpaque   = "lib/apk/db/.wh..wh..opq"
+)
 
-			file, err := os.Open(layerPath)
-			if err != nil {
-				return fmt.Errorf("failed to open layer %s: %w", layer, err)
-			}
-			defer func() { _ = file.Close() }() // Safely closes at the end of this anonymous function
+// layerResult records what a single layer did to the apk database: it either
+// wrote a new copy (db != nil) or deleted it via an OCI whiteout.
+type layerResult struct {
+	db       []byte
+	whiteout bool
+}
 
-			// We use bufio.Reader so we can "peek" ahead into the file stream without consuming it.
-			br := bufio.NewReader(file)
+// BuildSBOM streams the layers of the saved Docker image at imageTarPath, finds
+// the Alpine package database as it exists in the final merged filesystem,
+// parses it, and returns the installed packages (the SBOM). Layers are never
+// written to disk; ext supplies the size caps that bound the work against tar
+// bombs, shared cumulatively across every layer.
+func BuildSBOM(imageTarPath string, ext *extractor.Extractor, opts Options) ([]Package, error) {
+	walker := ext.NewStreamWalker()
 
-			// Peek at the first 2 bytes to check for the GZIP magic signature
-			headerBytes, err := br.Peek(2)
-			if err != nil && err != io.EOF {
-				return err
-			}
-
-			var tr *tar.Reader
-
-			// GZIP magic numbers are 0x1f and 0x8b
-			if len(headerBytes) == 2 && headerBytes[0] == 0x1f && headerBytes[1] == 0x8b {
-				// Layer is COMPRESSED. Wrap our stream in a gzip decompressor.
-				gzr, err := gzip.NewReader(br)
-				if err != nil {
-					return fmt.Errorf("failed to create gzip reader: %w", err)
-				}
-				defer func() { _ = gzr.Close() }()
-				tr = tar.NewReader(gzr)
-			} else {
-				// Layer is UNCOMPRESSED plain tar.
-				tr = tar.NewReader(br)
-			}
-
-			// Search inside the layer stream
-			for {
-				header, err := tr.Next()
-				if err == io.EOF {
-					break // End of this layer's tarball
-				}
-				if err != nil {
-					return err
-				}
-
-				if header.Name == "lib/apk/db/installed" {
-					if verbose {
-						fmt.Println("Found Alpine package database in layer:", layer)
-					}
-					sbom = parseAlpineDB(tr)
-				}
-			}
-			return nil
-		}()
-
-		if err != nil {
-			return nil, err
-		}
+	// Pass 1: locate and decode manifest.json. Its position in the outer archive
+	// is not guaranteed (Docker emits layer blobs before it), so we read the
+	// whole archive to find it.
+	layers, err := readLayers(imageTarPath, walker)
+	if err != nil {
+		return nil, err
+	}
+	layerSet := make(map[string]bool, len(layers))
+	for _, l := range layers {
+		layerSet[l] = true
 	}
 
+	// Pass 2: scan each layer blob for the apk database, keyed by layer name.
+	// We cannot resolve "last write wins" during the walk because the outer tar
+	// is not ordered by the manifest, so we record per-layer results and resolve
+	// afterwards.
+	results := make(map[string]layerResult, len(layers))
+	scan := func(hdr *tar.Header, body io.Reader) error {
+		if !layerSet[hdr.Name] {
+			return nil // config blob or other non-layer entry
+		}
+		res, err := scanLayer(walker, body)
+		if err != nil {
+			return fmt.Errorf("scan layer %q: %w", hdr.Name, err)
+		}
+		if res.db != nil || res.whiteout {
+			results[hdr.Name] = res
+			if opts.Verbose && res.db != nil {
+				fmt.Println("Found Alpine package database in layer:", hdr.Name)
+			}
+		}
+		return nil
+	}
+	if err := walkArchive(imageTarPath, walker, scan); err != nil {
+		return nil, err
+	}
+
+	// Resolve in manifest order: the last layer to write the database wins, and
+	// a whiteout deletes any database carried from earlier layers.
+	var winning []byte
+	for _, l := range layers {
+		res, ok := results[l]
+		if !ok {
+			continue
+		}
+		if res.whiteout {
+			winning = nil
+			continue
+		}
+		winning = res.db
+	}
+
+	// A whiteout (winning == nil) or an empty/unparseable database both yield
+	// zero packages; report that as "not found" rather than an empty SBOM, the
+	// same contract the disk-based path enforced.
+	sbom := parseAlpineDB(bytes.NewReader(winning))
 	if len(sbom) == 0 {
-		return nil, fmt.Errorf("could not find lib/apk/db/installed in any layer (is this an Alpine image?)")
+		return nil, fmt.Errorf("could not find %s in any layer (is this an Alpine image?)", apkDBPath)
 	}
 
 	return sbom, nil
+}
+
+// walkArchive opens the saved image tarball and walks its outer (uncompressed)
+// tar stream with fn under the walker's shared size budget.
+func walkArchive(imageTarPath string, walker *extractor.StreamWalker, fn extractor.WalkFunc) error {
+	file, err := os.Open(imageTarPath)
+	if err != nil {
+		return fmt.Errorf("open image tarball: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+
+	return walker.Walk(file, fn)
+}
+
+// readLayers walks the outer archive to find manifest.json and returns its
+// ordered layer list.
+func readLayers(imageTarPath string, walker *extractor.StreamWalker) ([]string, error) {
+	var layers []string
+	var found bool
+
+	err := walkArchive(imageTarPath, walker, func(hdr *tar.Header, body io.Reader) error {
+		if hdr.Name != manifestName {
+			return nil
+		}
+		l, err := GetImageLayers(body)
+		if err != nil {
+			return err
+		}
+		layers, found = l, true
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("could not find manifest.json in image tarball")
+	}
+
+	return layers, nil
+}
+
+// scanLayer descends into a single layer blob — gzip-compressed or plain tar —
+// and reports whether it writes or deletes the apk database. The descent reuses
+// walker so inner entries draw against the same cumulative size budget.
+func scanLayer(walker *extractor.StreamWalker, body io.Reader) (layerResult, error) {
+	// Peek at the first 2 bytes to detect the gzip magic signature without
+	// consuming the stream.
+	br := bufio.NewReader(body)
+	magic, err := br.Peek(2)
+	if err != nil && err != io.EOF {
+		return layerResult{}, err
+	}
+
+	var src io.Reader = br
+	if len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		gzr, err := gzip.NewReader(br)
+		if err != nil {
+			return layerResult{}, fmt.Errorf("gzip reader: %w", err)
+		}
+		defer func() { _ = gzr.Close() }()
+		src = gzr
+	}
+
+	var res layerResult
+	err = walker.Walk(src, func(hdr *tar.Header, entry io.Reader) error {
+		switch hdr.Name {
+		case apkDBPath:
+			b, err := io.ReadAll(entry)
+			if err != nil {
+				return fmt.Errorf("read apk database: %w", err)
+			}
+			res.db = b
+			res.whiteout = false
+		case apkDBWhiteout, apkDBOpaque:
+			res.db = nil
+			res.whiteout = true
+		}
+		return nil
+	})
+	if err != nil {
+		return layerResult{}, err
+	}
+
+	return res, nil
 }
 
 // parseAlpineDB reads the custom text format of the Alpine installed database
