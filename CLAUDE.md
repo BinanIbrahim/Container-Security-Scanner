@@ -51,7 +51,9 @@ govulncheck ./...                     # vulnerability scan
 
 ## Agents
 
-- **Before every push to GitHub**, run a code-reviewer agent on the changed files: "Use the code-reviewer agent to review the changes on this branch before I push." Do not push until the review passes or findings are explicitly accepted by the user.
+- **When you finish a roadmap item** (before the push that lands it), run two agents as one review gate: the code-reviewer agent (validating both that the code is correct *and* that it matches the approved Plan-agent design) and an architecture-review agent (checking the change against `ROADMAP.md`, the README, and this file). The approved plan is captured to a temporary local note (scratch file, not committed) and handed to the code-reviewer so it has something to check against. Do not push until the review passes or findings are explicitly accepted by the user.
+- **For any other push that changes Go code** (a standalone fix outside a roadmap item), still run the code-reviewer agent first. Pure docs/config pushes don't require it.
+- **The architecture-review agent reports drift and proposes doc edits** for the user to approve — it does not edit `CLAUDE.md` itself (see the contract rule in *Working With These Docs*) and applies README/`ROADMAP.md` edits only after approval.
 - **Before starting any new feature from `ROADMAP.md`**, spawn a Plan agent: "Use a Plan agent to design [feature name] based on the roadmap." The plan must be approved by the user before any code is written.
 
 ## Feature Briefing
