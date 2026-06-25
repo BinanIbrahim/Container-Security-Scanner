@@ -72,7 +72,7 @@ func main() {
 		fmt.Println("[*] Phase 1: Extracting Image...")
 	}
 
-	extractedPath, cleanup, err := extractor.ExtractImage(*imageFlag, textOutput)
+	imageTarPath, cleanup, err := extractor.SaveImage(*imageFlag, extractor.Options{Verbose: textOutput})
 	if err != nil {
 		log.Fatalf("Extraction failed: %v", err)
 	}
@@ -81,12 +81,8 @@ func main() {
 	if textOutput {
 		fmt.Println("[*] Phase 2: Analyzing Layers...")
 	}
-	layers, err := analyzer.GetImageLayers(extractedPath)
-	if err != nil {
-		log.Fatalf("Failed to read manifest: %v", err)
-	}
 
-	sbom, err := analyzer.BuildSBOM(extractedPath, layers, textOutput)
+	sbom, err := analyzer.BuildSBOM(imageTarPath, extractor.New(), analyzer.Options{Verbose: textOutput})
 	if err != nil {
 		log.Fatalf("Failed to build SBOM: %v", err)
 	}

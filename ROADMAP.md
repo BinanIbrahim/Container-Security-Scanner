@@ -6,7 +6,7 @@ Living document. Tick items off as they land; reorder when priorities change.
 
 - [x] **Real APK version comparison parity.** Current tokenizer in `internal/matcher/version.go` misses APK suffix semantics (`_alpha`, `_beta`, `_rc`, `_pre`, `_p`, `_git`). E.g. `1.2.2_pre2` should rank lower than `1.2.2`. Port logic from `apk-tools` `apk_version.c` and add a golden-file test suite.
 - [x] **Bounded tar extraction.** `internal/extractor/extractor.go` does unbounded `io.Copy` — malicious layer can fill disk (tar bomb). Wrap in `io.LimitReader` with configurable cap and reject symlinks/hardlinks pointing outside target.
-- [ ] **Stream layers instead of extracting to disk.** Today we untar the whole image then walk layers again. Read layers directly from the saved tar stream — faster, lower disk footprint, removes temp dir need for most scans.
+- [x] **Stream layers instead of extracting to disk.** Today we untar the whole image then walk layers again. Read layers directly from the saved tar stream — faster, lower disk footprint, removes temp dir need for most scans.
 - [ ] **SecDB caching.** On-disk cache keyed by `(version, repo, ETag/Last-Modified)` under `$XDG_CACHE_HOME/sentinel`. Adds offline support and cuts repeated network calls in CI.
 - [ ] **Context + cancellation.** Plumb `context.Context` through `extractor`, `analyzer`, `matcher`. A hung `docker pull` is currently unkillable.
 

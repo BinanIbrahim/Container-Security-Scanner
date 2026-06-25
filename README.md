@@ -11,9 +11,9 @@ ever-changing **vulnerability feed**, and understand **Alpine's APK versioning**
 rules to tell whether an installed version is actually older than the one that
 fixes a given CVE. Sentinel automates exactly that loop.
 
-Point it at an image and it works as a **pipeline**: it pulls and unpacks the
-image, reads the **Alpine package database** out of the layers to build a
-lightweight **SBOM** (software bill of materials), detects the Alpine OS version,
+Point it at an image and it works as a **pipeline**: it pulls and saves the
+image, then **streams** the **Alpine package database** out of the layers to
+build a lightweight **SBOM** (software bill of materials), detects the Alpine OS version,
 downloads the matching **Alpine Security Database (SecDB)**, and compares every
 installed package against the known fixes using an **APK-aware version
 comparator**. The result is a clear report of vulnerable packages with their
@@ -27,7 +27,7 @@ pulls in **no third-party dependencies**.
 - Scans **Docker images** from the command line (`--image`).
 - Machine-readable **JSON output** for **CI pipelines** (`--format json`).
 - **Policy-based build failure** thresholds (`--fail-on`).
-- Extracts and analyzes **image layers** to build an **SBOM**.
+- **Streams image layers** from the saved tar (no full extraction to disk) to build an **SBOM**.
 - Detects the Alpine version from `alpine-release` (with safe fallback to image-tag parsing).
 - Fetches and merges **Alpine SecDB** from both the `main` and `community` repositories.
 - **APK-aware version comparison**, including pre/post-release suffix semantics (see below).
@@ -47,13 +47,12 @@ next, and the whole thing is orchestrated by `cmd/scanner/main.go`.
 ┌───────────────────┐
 │  docker pull      │   ensure the image exists locally
 │  docker save      │   export it to image.tar          ── internal/extractor
-│  unpack tarball   │   untar into a temp dir (zip-slip guarded)
 └─────────┬─────────┘
-          │  unpacked image (manifest.json + layer tarballs)
+          │  saved image.tar (manifest.json + layer blobs)
           ▼
 ┌───────────────────┐
-│  read manifest    │   ordered list of layers
-│  walk each layer  │   gzip/plain auto-detected         ── internal/analyzer
+│  stream outer tar │   find manifest.json (any order)
+│  walk each layer  │   gzip/plain, in-memory, cap-guarded ── internal/analyzer
 │  parse apk DB     │   lib/apk/db/installed → SBOM
 └─────────┬─────────┘
           │  SBOM: []{name, version}
@@ -77,14 +76,14 @@ next, and the whole thing is orchestrated by `cmd/scanner/main.go`.
 Pipeline in one line:
 
 ```
-docker pull → docker save → unpack → SBOM → SecDB → match → report
+docker pull → docker save → stream layers → SBOM → SecDB → match → report
 ```
 
 ### Project structure
 
 - `cmd/scanner/main.go` — **CLI entrypoint**, matching loop, scoring, and report rendering.
-- `internal/extractor/` — pulls, saves, and unpacks **Docker images**.
-- `internal/analyzer/` — reads the manifest, walks layers, and builds the **SBOM** from the Alpine package DB.
+- `internal/extractor/` — pulls and saves **Docker images**, and provides the cap-guarded streaming tar walker.
+- `internal/analyzer/` — reads the manifest and streams layers to build the **SBOM** from the Alpine package DB.
 - `internal/matcher/` — fetches/merges **SecDB** and provides the **apk-aware version comparison**.
 
 ## Why a custom APK version comparator?
@@ -158,9 +157,8 @@ version, so nothing is flagged:
 Target: alpine:3.14
 
 [*] Phase 1: Extracting Image...
-Pulling and saving image 'alpine:3.14' (this might take a moment)...
 Pulling image 'alpine:3.14' from registry...
-Unpacking image layers...
+Saving image 'alpine:3.14' (using binary: /usr/local/bin/docker)...
 [*] Phase 2: Analyzing Layers...
 Found Alpine package database in layer: blobs/sha256/422ed46b1a92...
     -> Generated SBOM with 14 installed packages.
@@ -189,9 +187,8 @@ reports a vulnerable `apk-tools` with its CVE, severity, and remediation:
 Target: alpine:3.10
 
 [*] Phase 1: Extracting Image...
-Pulling and saving image 'alpine:3.10' (this might take a moment)...
 Pulling image 'alpine:3.10' from registry...
-Unpacking image layers...
+Saving image 'alpine:3.10' (using binary: /usr/local/bin/docker)...
 [*] Phase 2: Analyzing Layers...
 Found Alpine package database in layer: blobs/sha256/26d14edc4f17...
     -> Generated SBOM with 14 installed packages.

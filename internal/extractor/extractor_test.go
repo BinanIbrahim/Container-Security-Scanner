@@ -3,6 +3,8 @@ package extractor
 import (
 	"archive/tar"
 	"bytes"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +54,200 @@ func writeTar(t *testing.T, dir string, entries []entry) string {
 		t.Fatalf("write tar file: %v", err)
 	}
 	return path
+}
+
+// member is a synthetic tar entry carrying a body, used to build archives
+// in-memory for streaming tests.
+type member struct {
+	name     string
+	typeflag byte
+	body     []byte
+}
+
+// tarBytes builds a tarball in memory and returns its bytes.
+func tarBytes(t *testing.T, members []member) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, m := range members {
+		flag := m.typeflag
+		if flag == 0 {
+			flag = tar.TypeReg
+		}
+		hdr := &tar.Header{Name: m.name, Typeflag: flag, Size: int64(len(m.body)), Mode: 0o644}
+		if flag == tar.TypeDir {
+			hdr.Mode = 0o755
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write header %q: %v", m.name, err)
+		}
+		if len(m.body) > 0 {
+			if _, err := tw.Write(m.body); err != nil {
+				t.Fatalf("write body %q: %v", m.name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestWalkStream_DeliversRegularFiles(t *testing.T) {
+	t.Parallel()
+
+	archive := tarBytes(t, []member{
+		{name: "dir/", typeflag: tar.TypeDir},
+		{name: "dir/a.txt", body: []byte("alpha")},
+		{name: "link", typeflag: tar.TypeSymlink},
+		{name: "b.txt", body: []byte("bravo")},
+		// A legitimate OCI opaque whiteout marker: its name embeds ".." but has
+		// no ".." path component, so it must be delivered, not rejected.
+		{name: "lib/apk/db/.wh..wh..opq"},
+	})
+
+	got := make(map[string]string)
+	w := New().NewStreamWalker()
+	err := w.Walk(bytes.NewReader(archive), func(hdr *tar.Header, body io.Reader) error {
+		b, err := io.ReadAll(body)
+		if err != nil {
+			return err
+		}
+		got[hdr.Name] = string(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Walk returned error: %v", err)
+	}
+
+	want := map[string]string{
+		"dir/a.txt":               "alpha",
+		"b.txt":                   "bravo",
+		"lib/apk/db/.wh..wh..opq": "",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("delivered %d regular entries, want %d (%v)", len(got), len(want), got)
+	}
+	for name, body := range want {
+		if got[name] != body {
+			t.Errorf("entry %q body = %q, want %q", name, got[name], body)
+		}
+	}
+}
+
+func TestWalkStream_RejectedEntries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		members  []member
+		fileCap  int64
+		totalCap int64
+		readBody bool // whether the callback consumes each body (for total cap)
+		wantErr  string
+	}{
+		{
+			name:    "path traversal via ..",
+			members: []member{{name: "../evil.txt", body: []byte("x")}},
+			wantErr: "path traversal",
+		},
+		{
+			name:    "absolute path",
+			members: []member{{name: "/etc/passwd", body: []byte("x")}},
+			wantErr: "path traversal",
+		},
+		{
+			name:    "nested dotdot component",
+			members: []member{{name: "a/../../b", body: []byte("x")}},
+			wantErr: "path traversal",
+		},
+		{
+			name:    "single entry over file cap",
+			members: []member{{name: "big.txt", body: make([]byte, 1025)}},
+			fileCap: 1024,
+			wantErr: "file size exceeds cap",
+		},
+		{
+			name: "cumulative over total cap",
+			members: []member{
+				{name: "a.txt", body: make([]byte, 1024)},
+				{name: "b.txt", body: make([]byte, 1024)},
+			},
+			fileCap:  1024,
+			totalCap: 1024,
+			readBody: true,
+			wantErr:  "total extraction size exceeds cap",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			archive := tarBytes(t, tc.members)
+			e := &Extractor{FileSizeCap: tc.fileCap, TotalSizeCap: tc.totalCap}
+			err := e.NewStreamWalker().Walk(bytes.NewReader(archive), func(_ *tar.Header, body io.Reader) error {
+				if tc.readBody {
+					_, err := io.Copy(io.Discard, body)
+					return err
+				}
+				return nil
+			})
+			if err == nil {
+				t.Fatalf("Walk succeeded, want error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Walk error = %q, want substring %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestWalkStream_TotalCapSpansNestedWalks locks in the whole-image cumulative
+// budget: bytes read while descending into one stream and then a second, via
+// the same StreamWalker, accumulate against a single total cap.
+func TestWalkStream_TotalCapSpansNestedWalks(t *testing.T) {
+	t.Parallel()
+
+	inner := tarBytes(t, []member{{name: "file", body: make([]byte, 1024)}})
+	outer := tarBytes(t, []member{
+		{name: "layer-a", body: inner},
+		{name: "layer-b", body: inner},
+	})
+
+	// Per-entry cap is generous; the total cap is only large enough for one
+	// inner file's worth of bytes, so reading both layers must trip it.
+	e := &Extractor{FileSizeCap: 1 << 20, TotalSizeCap: 1500}
+	w := e.NewStreamWalker()
+	err := w.Walk(bytes.NewReader(outer), func(_ *tar.Header, body io.Reader) error {
+		// Descend into the layer with the SAME walker so the budget is shared.
+		return w.Walk(body, func(_ *tar.Header, entry io.Reader) error {
+			_, err := io.Copy(io.Discard, entry)
+			return err
+		})
+	})
+	if err == nil {
+		t.Fatal("Walk succeeded, want cumulative total cap error across nested walks")
+	}
+	if !strings.Contains(err.Error(), "total extraction size exceeds cap") {
+		t.Fatalf("Walk error = %q, want total cap error", err.Error())
+	}
+}
+
+// TestWalkStream_PropagatesCallbackError confirms a callback error stops the
+// walk and surfaces unchanged.
+func TestWalkStream_PropagatesCallbackError(t *testing.T) {
+	t.Parallel()
+
+	archive := tarBytes(t, []member{{name: "a.txt", body: []byte("x")}})
+	sentinel := fmt.Errorf("boom")
+	err := New().NewStreamWalker().Walk(bytes.NewReader(archive), func(_ *tar.Header, _ io.Reader) error {
+		return sentinel
+	})
+	if err != sentinel {
+		t.Fatalf("Walk error = %v, want %v", err, sentinel)
+	}
 }
 
 func TestUntar_SafeEntries(t *testing.T) {

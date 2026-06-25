@@ -1,5 +1,6 @@
-// Package extractor saves a Docker image via the docker CLI and unpacks its
-// layers into a temporary directory for analysis.
+// Package extractor saves a Docker image via the docker CLI and provides
+// primitives for reading its layers — either unpacking them to disk or walking
+// them in memory — under tar-bomb size guards.
 package extractor
 
 import (
@@ -12,36 +13,38 @@ import (
 	"strings"
 )
 
-// ExtractImage saves the docker image to a temporary directory and unpacks it.
-// It returns the path to the unpacked directory, and a cleanup function.
-func ExtractImage(imageName string, verbose bool) (string, func(), error) {
+// Options configures image extraction.
+type Options struct {
+	// Verbose enables progress output to stdout.
+	Verbose bool
+}
+
+// SaveImage pulls imageName and writes it to a tarball via `docker save`,
+// returning the path to that tarball and a cleanup function that removes the
+// temporary directory holding it. The image is not unpacked; callers stream its
+// layers directly from the saved tar (see Extractor.NewStreamWalker).
+func SaveImage(imageName string, opts Options) (string, func(), error) {
 	// 1. Create a secure temporary directory
 	tempDir, err := os.MkdirTemp("", "sentinel-scanner-*")
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to create temp dir: %w", err)
+		return "", nil, fmt.Errorf("create temp dir: %w", err)
 	}
 
 	// Setup our cleanup function to wipe the temp files when we are done
 	cleanup := func() {
 		_ = os.RemoveAll(tempDir)
-		if verbose {
+		if opts.Verbose {
 			fmt.Println("Cleaned up temporary files.")
 		}
 	}
 
 	tarPath := filepath.Join(tempDir, "image.tar")
-	extractPath := filepath.Join(tempDir, "unpacked")
-
-	// 2. Shell out to Docker to save the image
-	if verbose {
-		fmt.Printf("Pulling and saving image '%s' (this might take a moment)...\n", imageName)
-	}
 
 	// Find the docker binary safely
 	dockerBinary := getDockerPath()
 
-	// 1.5. Pull the image from the registry to ensure it exists locally
-	if verbose {
+	// Pull the image from the registry to ensure it exists locally
+	if opts.Verbose {
 		fmt.Printf("Pulling image '%s' from registry...\n", imageName)
 	}
 	pullCmd := exec.Command(dockerBinary, "pull", imageName)
@@ -49,9 +52,9 @@ func ExtractImage(imageName string, verbose bool) (string, func(), error) {
 		return "", cleanup, fmt.Errorf("docker pull failed: %v\nOutput: %s", err, output)
 	}
 
-	// 2. Shell out to Docker to save the image
-	if verbose {
-		fmt.Printf("Pulling and saving image '%s' (using binary: %s)...\n", imageName, dockerBinary)
+	// Shell out to Docker to save the image
+	if opts.Verbose {
+		fmt.Printf("Saving image '%s' (using binary: %s)...\n", imageName, dockerBinary)
 	}
 	cmd := exec.Command(dockerBinary, "save", "-o", tarPath, imageName)
 
@@ -60,19 +63,7 @@ func ExtractImage(imageName string, verbose bool) (string, func(), error) {
 		return "", cleanup, fmt.Errorf("docker save failed: %v\nOutput: %s", err, output)
 	}
 
-	// 3. Unpack the tarball
-	if err := os.Mkdir(extractPath, 0750); err != nil {
-		return "", cleanup, fmt.Errorf("failed to create extract dir: %w", err)
-	}
-
-	if verbose {
-		fmt.Println("Unpacking image layers...")
-	}
-	if err := New().Untar(tarPath, extractPath); err != nil {
-		return "", cleanup, fmt.Errorf("failed to untar image: %w", err)
-	}
-
-	return extractPath, cleanup, nil
+	return tarPath, cleanup, nil
 }
 
 // DefaultFileSizeCap is the maximum number of bytes extracted for a single tar
@@ -222,6 +213,111 @@ func (e *Extractor) Untar(tarball, targetDir string) error {
 		}
 	}
 	return nil
+}
+
+// WalkFunc is invoked for each regular-file entry encountered by
+// StreamWalker.Walk. body is capped at the per-entry size limit; reading past it
+// causes the walk to fail. Returning a non-nil error stops the walk and is
+// propagated to the caller. body must not be retained after fn returns.
+type WalkFunc func(hdr *tar.Header, body io.Reader) error
+
+// StreamWalker walks one or more tar streams under a single shared cumulative
+// size budget, enforcing the same per-entry and total caps as Untar without
+// writing anything to disk. A walker is created per image so the cumulative cap
+// spans every layer (and the bytes drawn descending into them), mirroring the
+// whole-image budget the disk-based Untar enforced.
+type StreamWalker struct {
+	ext   *Extractor
+	total int64
+}
+
+// NewStreamWalker returns a StreamWalker that draws against the extractor's
+// configured caps. Reuse one walker across an image's layers so the total cap
+// is cumulative; create a fresh walker per image.
+func (e *Extractor) NewStreamWalker() *StreamWalker {
+	return &StreamWalker{ext: e}
+}
+
+// Walk reads the tar stream r and calls fn for each regular-file entry. Entry
+// names that are absolute or contain a ".." path component are rejected. Each
+// body fn receives is bounded by the per-entry cap, and every byte fn reads —
+// at this level or any nested Walk sharing this StreamWalker — draws down the
+// shared total budget. Non-regular entries (directories, links) are skipped;
+// because nothing is written to disk, their link targets need no resolution.
+func (w *StreamWalker) Walk(r io.Reader, fn WalkFunc) error {
+	tr := tar.NewReader(r)
+	fileCap := w.ext.fileSizeCap()
+	totalCap := w.ext.totalSizeCap()
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		// Reject path traversal up front. Unlike Untar's coarse substring check
+		// (which writes to disk and so errs on the side of rejection), a stream
+		// walk only matches entry names, so we reject a ".." path component
+		// precisely — this lets through legitimate OCI whiteout markers such as
+		// ".wh..wh..opq" whose names embed "..".
+		if filepath.IsAbs(header.Name) || hasDotDotComponent(header.Name) {
+			return fmt.Errorf("walk entry %q: path traversal detected", header.Name)
+		}
+
+		if header.Typeflag != tar.TypeReg {
+			continue
+		}
+
+		// Reject any single entry whose declared size blows the per-entry cap
+		// before we read or skip it.
+		if header.Size > fileCap {
+			return fmt.Errorf("walk entry %q: file size exceeds cap of %d bytes", header.Name, fileCap)
+		}
+
+		// Cap the body at fileCap+1 so a callback that reads it fully can tell
+		// "fit exactly" from "overflowed", and count every consumed byte against
+		// the shared cumulative budget.
+		body := &countingReader{r: io.LimitReader(tr, fileCap+1), total: &w.total}
+		if err := fn(header, body); err != nil {
+			return err
+		}
+		if body.n > fileCap {
+			return fmt.Errorf("walk entry %q: file size exceeds cap of %d bytes", header.Name, fileCap)
+		}
+		if w.total > totalCap {
+			return fmt.Errorf("walk entry %q: total extraction size exceeds cap of %d bytes", header.Name, totalCap)
+		}
+	}
+	return nil
+}
+
+// countingReader tracks how many bytes have been read both for the current
+// entry (n) and across the whole walk (the shared total).
+type countingReader struct {
+	r     io.Reader
+	n     int64
+	total *int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	*c.total += int64(n)
+	return n, err
+}
+
+// hasDotDotComponent reports whether name contains a ".." path component,
+// treating "/" as the separator regardless of host OS (tar paths are slash-based).
+func hasDotDotComponent(name string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(name), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // isSafePath reports whether joining root and name stays within root after
